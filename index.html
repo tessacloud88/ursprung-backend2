@@ -298,20 +298,41 @@ function App() {
   const handleFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = "";
     const url = URL.createObjectURL(file);
-    let ocrText = "";
+    const fingerprint = await sha256Hex(file.name + file.size + Date.now());
+    const id = nextId.current++;
+    const item = {
+      id,
+      type: "image",
+      content: file.name,
+      fingerprint,
+      status: "idle",
+      matches: [],
+      imageUrl: url,
+      fileName: file.name,
+      ocrText: "",
+      ocrPending: true,
+      file,
+    };
+    // Sofort anzeigen, damit du direkt eine Rückmeldung siehst — die
+    // Texterkennung läuft danach im Hintergrund weiter (kann bei großen
+    // Fotos auf einem Tablet 15–60 Sekunden dauern).
+    setItems((prev) => [item, ...prev]);
+
     if (ocrReady && window.Tesseract) {
       setOcrLoading(true);
       try {
         const { data } = await window.Tesseract.recognize(file, "deu+eng");
-        ocrText = (data?.text || "").trim();
+        const ocrText = (data?.text || "").trim();
+        setItems((prev) => prev.map((i) => (i.id === id ? { ...i, ocrText, ocrPending: false } : i)));
       } catch (err) {
-        ocrText = "";
+        setItems((prev) => prev.map((i) => (i.id === id ? { ...i, ocrPending: false } : i)));
       }
       setOcrLoading(false);
+    } else {
+      setItems((prev) => prev.map((i) => (i.id === id ? { ...i, ocrPending: false } : i)));
     }
-    await addItem("image", ocrText || file.name, { imageUrl: url, fileName: file.name, ocrText, file });
-    e.target.value = "";
   };
 
   // Führt den eigentlichen Scan für ein Item aus (per Objekt, nicht nur ID,
@@ -584,7 +605,9 @@ function App() {
                     </div>
                     <div style={{ fontSize: 14, lineHeight: 1.5 }}>
                       {item.type === "image"
-                        ? item.ocrText
+                        ? item.ocrPending
+                          ? "⏳ Text wird aus dem Bild gelesen…"
+                          : item.ocrText
                           ? `„${item.ocrText.slice(0, 140)}${item.ocrText.length > 140 ? "…" : ""}“`
                           : `${item.fileName} — kein Text im Bild erkannt`
                         : `„${item.content.slice(0, 160)}${item.content.length > 160 ? "…" : ""}“`}
