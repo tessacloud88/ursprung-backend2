@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ursprung — Content-Herkunfts-Scanner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>body{margin:0;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+/**
+ * URSPRUNG — Content-Herkunfts-Scanner
+ * ------------------------------------------------------------------
+ * Demo-Frontend. Sucht NUR nach Inhalten, die der eingeloggte Nutzer
+ * selbst hochgeladen hat (eigene Texte/Bilder), niemals nach fremden
+ * Personen oder Accounts.
+ *
+ * Echte Zutaten in dieser Demo:
+ *  - SHA-256 Fingerprinting (Web Crypto API, läuft im Browser)
+ *  - Client-seitige OCR für Bilder via Tesseract.js (CDN, WASM)
+ *
+ * Simulierte Zutaten (klar markiert, siehe SCAN_PROVIDERS unten):
+ *  - Die eigentliche plattformübergreifende Suche. Dafür gibt es keine
+ *    offizielle LinkedIn/Instagram-API. In echt würde man das über
+ *    Reverse-Image/Text-Suchdienste lösen (Google Vision Web Detection,
+ *    TinEye, Copyscape). Diese Demo simuliert deren Antwort, damit du
+ *    den kompletten Nutzerfluss siehst, ohne eigene API-Keys zu brauchen.
+ *    Siehe UrsprungBackend/ für den echten Anbindungs-Bauplan.
+ */
+
+// ---------- Backend-Verbindung ----------
+// Trage hier die URL deines live laufenden Backends ein (z.B. von Render).
+// Lass es leer (""), um bei den simulierten Demo-Daten zu bleiben.
+const BACKEND_URL = "https://ursprung-backend.onrender.com";
+
+// ---------- Design tokens ----------
+const T = {
+  bg: "#10161A",
+  surface: "#171F24",
+  surface2: "#1E282E",
+  ink: "#E7EDEF",
+  muted: "#7C8A90",
+  accent: "#3ED9A3",
+  alert: "#FF6B4A",
+  border: "#26323A",
+};
+
+// ---------- Utilities ----------
+async function sha256Hex(input) {
+  const enc = new TextEncoder().encode(input);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Deterministic pseudo-random from a hash, so demo results stay stable per item
+function seededRandom(seed) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return () => {
+    h = (h * 1664525 + 1013904223) >>> 0;
+    return h / 4294967296;
+  };
+}
+
+const DEMO_PLATFORMS = ["Instagram", "TikTok", "YouTube"];
+const DEMO_SNIPPETS = [
+  { text: "…dieser Ansatz hat mein Team komplett verändert…", path: "posts/a17f92" },
+  { text: "Repost ohne Quellenangabe im Kommentarbereich gefunden", path: "p/CxT4kQrLmZa" },
+  { text: "Bild taucht in einem Karussell-Post identisch wieder auf", path: "reel/DAb3RttQx1" },
+  { text: "Dein Wortlaut großteils übernommen, ohne Quellenangabe", path: "posts/b82c14" },
+  { text: "Videoclip 1:1 als Repost gefunden, Ton entfernt", path: "@user123/video/7291" },
+  { text: "Dein Wortlaut in Videotitel & Beschreibung gefunden", path: "watch?v=dQw4w9WgXcQ" },
+];
+
+// Demo-Inhalte, die simulieren, dass gerade ein neuer LinkedIn-Post
+// des Nutzers automatisch erkannt wurde. In Produktion würde hier
+// die LinkedIn Community Management API (Webhook oder Polling) den
+// echten, neu veröffentlichten Beitrag liefern.
+const AUTO_DETECTED_POSTS = [
+  "5 Learnings aus 2 Jahren Remote-Leadership – ein Thread.",
+  "Warum ich glaube, dass jedes Team eine klare Entscheidungsstruktur braucht.",
+  "Kurzes Recap unseres Produkt-Launches diese Woche.",
+];
+
+/**
+ * Echter Scan gegen dein Backend (falls BACKEND_URL gesetzt ist).
+ * Ruft je nach Inhaltstyp die passenden Routen auf. Jeder Such-Dienst
+ * wird einzeln abgefragt und einzeln abgesichert (try/catch) — fehlt
+ * z.B. der YouTube-Key, bricht der Scan nicht komplett ab, sondern
+ * liefert einfach nur die Ergebnisse der Dienste, die konfiguriert sind.
+ */
+async function scanContentAcrossPlatforms(item) {
+  if (!BACKEND_URL) {
+    // Fallback: simulierte Demo-Daten (kein Backend verbunden)
+    await new Promise((r) => setTimeout(r, 1400 + Math.random() * 900));
+    const rand = seededRandom(item.fingerprint);
+    if (rand() <= 0.45) return [];
+    const count = 1 + Math.floor(rand() * 2);
+    return Array.from({ length: count }).map((_, i) => {
+      const platform = DEMO_PLATFORMS[Math.floor(rand() * DEMO_PLATFORMS.length)];
+      const found = DEMO_SNIPPETS[Math.floor(rand() * DEMO_SNIPPETS.length)];
+      const domain = platform === "Instagram" ? "instagram.com" : platform === "TikTok" ? "tiktok.com" : "youtube.com";
+      return {
+        id: `${item.id}-m${i}`,
+        platform,
+        snippet: found.text,
+        similarity: Math.round(70 + rand() * 29),
+        url: `https://${domain}/${found.path}`,
+        demo: true,
+      };
+    });
+  }
+
+  const results = [];
+
+  if (item.type === "text") {
+    const youtube = await fetch(`${BACKEND_URL}/api/scan/youtube`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: item.content }),
+    })
+      .then((r) => r.json())
+      .catch((err) => ({ error: err.message }));
+
+    if (youtube?.matches) {
+      results.push(
+        ...youtube.matches.map((m, i) => ({
+          id: `${item.id}-yt${i}`,
+          platform: "YouTube",
+          snippet: m.title,
+          similarity: null,
+          url: m.url,
+        }))
+      );
+    }
+    // Hinweis: Copyscape-Textsuche (/api/scan/text) ist im Backend als
+    // Rohantwort (XML) angelegt und noch nicht für die Anzeige geparst —
+    // siehe TODO in backend/server.js.
+  }
+
+  if (item.type === "image" && item.file) {
+    const formData = new FormData();
+    formData.append("image", item.file);
+    let vision;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/scan/image`, {
+        method: "POST",
+        body: formData,
+      });
+      vision = await res.json();
+      if (!res.ok) {
+        throw new Error(vision?.error || `Server antwortete mit Status ${res.status}`);
+      }
+    } catch (err) {
+      return [
+        {
+          id: `${item.id}-err`,
+          platform: "Fehler",
+          snippet: `Backend-Fehler: ${err.message}`,
+          similarity: null,
+          url: null,
+          isError: true,
+        },
+      ];
+    }
+
+    if (vision?.matches) {
+      results.push(
+        ...vision.matches.map((m, i) => ({
+          id: `${item.id}-img${i}`,
+          platform: "Web (Google Vision)",
+          snippet: m.title || "Bild gefunden",
+          similarity: null,
+          url: m.url,
+        }))
+      );
+    }
+  }
+
+  return results;
+}
+
+// ---------- Fingerprint visual (signature element) ----------
+function FingerprintBars({ hash, state }) {
+  const bytes = (hash || "0".repeat(48)).match(/.{1,2}/g).slice(0, 24);
+  const color = state === "match" ? T.alert : state === "scanning" ? T.muted : T.accent;
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 40 }}>
+      {bytes.map((b, i) => {
+        const v = parseInt(b, 16) / 255;
+        return (
+          <div
+            key={i}
+            style={{
+              width: 3,
+              height: `${8 + v * 32}px`,
+              background: color,
+              borderRadius: 1,
+              opacity: state === "scanning" ? 0.35 + 0.5 * ((i % 6) / 6) : 0.9,
+              animation: state === "scanning" ? `ursprung-pulse 1.1s ease-in-out ${i * 0.03}s infinite` : "none",
+              transition: "background 0.4s ease",
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- Account linking (mock OAuth) ----------
+function AccountChip({ name, linked, onToggle }) {
+  return (
+    <button
+      onClick={onToggle}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "8px 14px",
+        borderRadius: 999,
+        border: `1px solid ${linked ? T.accent : T.border}`,
+        background: linked ? "rgba(62,217,163,0.08)" : T.surface2,
+        color: linked ? T.accent : T.muted,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 13,
+        cursor: "pointer",
+        transition: "all 0.2s ease",
+      }}
+    >
+      <span
+        style={{
+          width: 7,
+          height: 7,
+          borderRadius: "50%",
+          background: linked ? T.accent : T.muted,
+        }}
+      />
+      {name} · {linked ? "verknüpft" : "verknüpfen"}
+    </button>
+  );
+}
+
+// ---------- Main App ----------
+function App() {
+  const [accounts, setAccounts] = useState({ LinkedIn: false, Instagram: false, TikTok: false, YouTube: false });
+  const [items, setItems] = useState([]);
+  const [textDraft, setTextDraft] = useState("");
+  const [ocrReady, setOcrReady] = useState(false);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [autoScan, setAutoScan] = useState(false);
+  const autoTimer = useRef(null);
+  const fileInputRef = useRef(null);
+  const nextId = useRef(1);
+
+  // Lazy-load Tesseract.js from CDN for real client-side OCR
+  useEffect(() => {
+    if (window.Tesseract) {
+      setOcrReady(true);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js";
+    script.async = true;
+    script.onload = () => setOcrReady(true);
+    script.onerror = () => setOcrReady(false);
+    document.body.appendChild(script);
+  }, []);
+
+  const addItem = useCallback(async (type, content, extra = {}) => {
+    const fingerprint = await sha256Hex(content || Math.random().toString());
+    const item = {
+      id: nextId.current++,
+      type,
+      content,
+      fingerprint,
+      status: "idle", // idle | scanning | clean | match
+      matches: [],
+      ...extra,
+    };
+    setItems((prev) => [item, ...prev]);
+  }, []);
+
+  const handleAddText = async () => {
+    if (!textDraft.trim()) return;
+    await addItem("text", textDraft.trim());
+    setTextDraft("");
+  };
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    let ocrText = "";
+    if (ocrReady && window.Tesseract) {
+      setOcrLoading(true);
+      try {
+        const { data } = await window.Tesseract.recognize(file, "deu+eng");
+        ocrText = (data?.text || "").trim();
+      } catch (err) {
+        ocrText = "";
+      }
+      setOcrLoading(false);
+    }
+    await addItem("image", ocrText || file.name, { imageUrl: url, fileName: file.name, ocrText, file });
+    e.target.value = "";
+  };
+
+  // Führt den eigentlichen Scan für ein Item aus (per Objekt, nicht nur ID,
+  // damit auch frisch automatisch erkannte Posts sofort gescannt werden
+  // können, ohne auf einen React-State-Refresh warten zu müssen).
+  const scanItemObject = useCallback(async (item) => {
+    setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, status: "scanning" } : i)));
+    const matches = await scanContentAcrossPlatforms(item);
+    setItems((prev) =>
+      prev.map((i) =>
+        i.id === item.id ? { ...i, status: matches.length ? "match" : "clean", matches } : i
+      )
+    );
+  }, []);
+
+  const runScan = (id) => {
+    const target = items.find((i) => i.id === id);
+    if (target) scanItemObject(target);
+  };
+
+  // Simuliert: LinkedIn meldet automatisch einen neuen eigenen Post.
+  // In Produktion: Webhook/Polling der LinkedIn Community Management API
+  // (siehe backend/pipeline.js), das den echten neuen Post liefert.
+  const simulateAutoDetectedPost = useCallback(async () => {
+    const content = AUTO_DETECTED_POSTS[Math.floor(Math.random() * AUTO_DETECTED_POSTS.length)];
+    const fingerprint = await sha256Hex(content + Date.now());
+    const item = {
+      id: nextId.current++,
+      type: "text",
+      content,
+      fingerprint,
+      status: "idle",
+      matches: [],
+      source: "auto",
+    };
+    setItems((prev) => [item, ...prev]);
+    scanItemObject(item);
+  }, [scanItemObject]);
+
+  useEffect(() => {
+    if (autoScan && accounts.LinkedIn) {
+      autoTimer.current = setInterval(simulateAutoDetectedPost, 25000);
+      return () => clearInterval(autoTimer.current);
+    }
+  }, [autoScan, accounts.LinkedIn, simulateAutoDetectedPost]);
+
+  const anyLinked = accounts.LinkedIn || accounts.Instagram || accounts.TikTok || accounts.YouTube;
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: T.bg,
+        color: T.ink,
+        fontFamily: "'Inter', sans-serif",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        @keyframes ursprung-pulse {
+          0%, 100% { opacity: 0.3; }
+          50% { opacity: 0.9; }
+        }
+        @keyframes ursprung-in {
+          from { opacity: 0; transform: translateY(6px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .ursprung-card { animation: ursprung-in 0.35s ease both; }
+        .ursprung-scroll::-webkit-scrollbar { width: 8px; }
+        .ursprung-scroll::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
+        button:focus-visible, input:focus-visible, textarea:focus-visible {
+          outline: 2px solid ${T.accent}; outline-offset: 2px;
+        }
+      `}</style>
+
+      <div style={{ maxWidth: 880, margin: "0 auto", padding: "40px 20px 80px" }}>
+        {/* Header */}
+        <header style={{ marginBottom: 36 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+            <FingerprintBars hash={"a1"} state="idle" />
+            <h1
+              style={{
+                fontFamily: "'Space Grotesk', sans-serif",
+                fontWeight: 700,
+                fontSize: 26,
+                letterSpacing: "-0.02em",
+                margin: 0,
+              }}
+            >
+              Ursprung
+            </h1>
+          </div>
+          <p style={{ color: T.muted, margin: 0, fontSize: 15, maxWidth: 520 }}>
+            Erstelle einen digitalen Fingerabdruck deiner eigenen Inhalte und prüfe,
+            ob sie ohne dein Wissen anderswo wieder auftauchen.
+          </p>
+        </header>
+
+        {/* Account linking */}
+        <section
+          className="ursprung-card"
+          style={{
+            background: T.surface,
+            border: `1px solid ${T.border}`,
+            borderRadius: 14,
+            padding: 20,
+            marginBottom: 20,
+          }}
+        >
+          <h2 style={{ fontSize: 13, textTransform: "uppercase", letterSpacing: "0.08em", color: T.muted, margin: "0 0 12px", fontFamily: "'JetBrains Mono', monospace" }}>
+            Eigene Konten verknüpfen
+          </h2>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {Object.keys(accounts).map((name) => (
+              <AccountChip
+                key={name}
+                name={name}
+                linked={accounts[name]}
+                onToggle={() => setAccounts((a) => ({ ...a, [name]: !a[name] }))}
+              />
+            ))}
+          </div>
+          {!anyLinked && (
+            <p style={{ color: T.muted, fontSize: 13, marginTop: 10, marginBottom: 0 }}>
+              Verknüpfe mindestens ein Konto, um Scans zu starten. Es werden ausschließlich
+              deine eigenen Inhalte durchsucht.
+            </p>
+          )}
+
+          {accounts.LinkedIn && (
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                marginTop: 16,
+                paddingTop: 14,
+                borderTop: `1px solid ${T.border}`,
+                fontSize: 13,
+                color: T.ink,
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={autoScan}
+                onChange={(e) => setAutoScan(e.target.checked)}
+                style={{ width: 16, height: 16, accentColor: T.accent }}
+              />
+              Neue LinkedIn-Posts automatisch gegen Instagram, TikTok &amp; YouTube scannen
+              <span style={{ color: T.muted, fontFamily: "'JetBrains Mono', monospace", fontSize: 11 }}>
+                (Demo: simuliert alle 25s)
+              </span>
+            </label>
+          )}
+        </section>
+
+        {/* Add content */}
+        <section
+          className="ursprung-card"
+          style={{
+            background: T.surface,
+            border: `1px solid ${T.border}`,
+            borderRadius: 14,
+            padding: 20,
+            marginBottom: 28,
+          }}
+        >
+          <h2 style={{ fontSize: 13, textTransform: "uppercase", letterSpacing: "0.08em", color: T.muted, margin: "0 0 12px", fontFamily: "'JetBrains Mono', monospace" }}>
+            Eigenen Inhalt hinzufügen
+          </h2>
+          <textarea
+            value={textDraft}
+            onChange={(e) => setTextDraft(e.target.value)}
+            placeholder="Eigenen Text einfügen, den du schützen möchtest…"
+            style={{
+              width: "100%",
+              minHeight: 70,
+              resize: "vertical",
+              background: T.surface2,
+              border: `1px solid ${T.border}`,
+              borderRadius: 10,
+              padding: 12,
+              color: T.ink,
+              fontFamily: "'Inter', sans-serif",
+              fontSize: 14,
+              boxSizing: "border-box",
+            }}
+          />
+          <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <button
+              onClick={handleAddText}
+              disabled={!textDraft.trim()}
+              style={{
+                background: T.accent,
+                color: "#0A1512",
+                border: "none",
+                borderRadius: 8,
+                padding: "9px 16px",
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: textDraft.trim() ? "pointer" : "not-allowed",
+                opacity: textDraft.trim() ? 1 : 0.5,
+              }}
+            >
+              Text hinzufügen
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              style={{
+                background: "transparent",
+                color: T.ink,
+                border: `1px solid ${T.border}`,
+                borderRadius: 8,
+                padding: "9px 16px",
+                fontSize: 14,
+                cursor: "pointer",
+              }}
+            >
+              Bild hochladen (mit OCR)
+            </button>
+            <input ref={fileInputRef} type="file" accept="image/*" hidden onChange={handleFile} />
+            <span style={{ fontSize: 12, color: T.muted, fontFamily: "'JetBrains Mono', monospace" }}>
+              {ocrLoading ? "Text wird aus Bild gelesen…" : ocrReady ? "OCR bereit" : "OCR lädt…"}
+            </span>
+          </div>
+        </section>
+
+        {/* Content list */}
+        <section>
+          <h2 style={{ fontSize: 13, textTransform: "uppercase", letterSpacing: "0.08em", color: T.muted, margin: "0 0 12px", fontFamily: "'JetBrains Mono', monospace" }}>
+            Verfolgte Inhalte ({items.length})
+          </h2>
+
+          {items.length === 0 && (
+            <div
+              style={{
+                border: `1px dashed ${T.border}`,
+                borderRadius: 14,
+                padding: 28,
+                textAlign: "center",
+                color: T.muted,
+                fontSize: 14,
+              }}
+            >
+              Noch nichts hier. Füge oben einen Text oder ein Bild hinzu, um deinen ersten
+              Fingerabdruck zu erstellen.
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {items.map((item) => (
+              <div
+                key={item.id}
+                className="ursprung-card"
+                style={{
+                  background: T.surface,
+                  border: `1px solid ${item.status === "match" ? T.alert : T.border}`,
+                  borderRadius: 14,
+                  padding: 18,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+                  <div style={{ flex: 1, minWidth: 220 }}>
+                    <div style={{ fontSize: 11, color: T.muted, fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>
+                      {item.type === "text" ? "TEXT" : "BILD · OCR"} · #{item.fingerprint.slice(0, 10)}
+                      {item.source === "auto" && (
+                        <span style={{ color: T.accent }}> · automatisch von LinkedIn erkannt</span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 14, lineHeight: 1.5 }}>
+                      {item.type === "image"
+                        ? item.ocrText
+                          ? `„${item.ocrText.slice(0, 140)}${item.ocrText.length > 140 ? "…" : ""}“`
+                          : `${item.fileName} — kein Text im Bild erkannt`
+                        : `„${item.content.slice(0, 160)}${item.content.length > 160 ? "…" : ""}“`}
+                    </div>
+                  </div>
+                  <FingerprintBars hash={item.fingerprint} state={item.status === "scanning" ? "scanning" : item.status === "match" ? "match" : "idle"} />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14 }}>
+                  <span
+                    style={{
+                      fontSize: 12,
+                      fontFamily: "'JetBrains Mono', monospace",
+                      color: item.status === "match" ? T.alert : item.status === "clean" ? T.accent : T.muted,
+                    }}
+                  >
+                    {item.status === "idle" && "Noch nicht gescannt"}
+                    {item.status === "scanning" && "Scanne Plattformen…"}
+                    {item.status === "clean" && "Keine Treffer gefunden"}
+                    {item.status === "match" && `${item.matches.length} Treffer gefunden`}
+                  </span>
+                  <button
+                    onClick={() => runScan(item.id)}
+                    disabled={!anyLinked || item.status === "scanning"}
+                    style={{
+                      background: "transparent",
+                      border: `1px solid ${T.accent}`,
+                      color: T.accent,
+                      borderRadius: 8,
+                      padding: "6px 14px",
+                      fontSize: 13,
+                      cursor: anyLinked && item.status !== "scanning" ? "pointer" : "not-allowed",
+                      opacity: anyLinked && item.status !== "scanning" ? 1 : 0.4,
+                    }}
+                  >
+                    {item.status === "scanning" ? "…" : "Scan starten"}
+                  </button>
+                </div>
+
+                {item.matches.length > 0 && (
+                  <div style={{ marginTop: 14, borderTop: `1px solid ${T.border}`, paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                    <span
+                      style={{
+                        alignSelf: "flex-start",
+                        fontSize: 10,
+                        fontFamily: "'JetBrains Mono', monospace",
+                        letterSpacing: "0.06em",
+                        color: item.matches[0]?.isError ? T.alert : item.matches[0]?.demo ? T.muted : T.accent,
+                        border: `1px solid ${item.matches[0]?.isError ? T.alert : item.matches[0]?.demo ? T.border : T.accent}`,
+                        borderRadius: 999,
+                        padding: "2px 8px",
+                      }}
+                    >
+                      {item.matches[0]?.isError
+                        ? "FEHLER BEIM BACKEND-AUFRUF"
+                        : item.matches[0]?.demo
+                        ? "DEMO-DATEN · ERFUNDEN, KEIN ECHTER FUND"
+                        : "LIVE-ERGEBNIS · ECHTER SCAN"}
+                    </span>
+                    {item.matches.map((m) => (
+                      <div
+                        key={m.id}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          background: T.surface2,
+                          borderRadius: 8,
+                          padding: "10px 12px",
+                          fontSize: 13,
+                          gap: 12,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span style={{ minWidth: 0 }}>
+                          <strong style={{ color: T.alert }}>{m.platform}</strong>
+                          <span style={{ color: T.muted }}> — {m.snippet}</span>
+                        </span>
+                        {!m.isError && (
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, marginLeft: "auto" }}>
+                            {m.similarity != null && (
+                              <span style={{ fontFamily: "'JetBrains Mono', monospace", color: T.muted }}>
+                                {m.similarity}%
+                              </span>
+                            )}
+                            <a
+                              href={m.url}
+                              target={m.demo ? undefined : "_blank"}
+                              rel={m.demo ? undefined : "noopener noreferrer"}
+                              onClick={
+                                m.demo
+                                  ? (e) => {
+                                      e.preventDefault();
+                                      alert(
+                                        `Demo-Link (führt bewusst nicht ins echte Web):\n${m.url}\n\nIn der produktiven Version wäre das die tatsächliche Fundstelle, geliefert vom jeweiligen Suchdienst (z.B. Google Vision).`
+                                      );
+                                    }
+                                  : undefined
+                              }
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 6,
+                                background: "rgba(255,107,74,0.12)",
+                                border: `1px solid ${T.alert}`,
+                                color: T.alert,
+                                borderRadius: 6,
+                                padding: "5px 10px",
+                                fontSize: 12,
+                                fontWeight: 600,
+                                textDecoration: "none",
+                                whiteSpace: "nowrap",
+                                cursor: "pointer",
+                              }}
+                            >
+                              Beitrag ansehen ↗
+                            </a>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <p style={{ marginTop: 40, fontSize: 12, color: T.muted, lineHeight: 1.6 }}>
+          Hinweis: Bildscans (Google Vision) und die YouTube-Titel/-Beschreibungssuche
+          laufen live gegen dein verbundenes Backend, sofern die entsprechenden API-Keys
+          dort hinterlegt sind. Instagram/TikTok-Treffer sowie die automatische Erkennung
+          neuer LinkedIn-Posts sind weiterhin simuliert (dafür gibt es keine passende
+          offizielle API) — siehe die begleitende Backend-Vorlage für Details.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
